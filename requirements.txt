@@ -4,3 +4,8 @@ pandas
 numpy
 requests
 ta
+gspread
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+pytz
