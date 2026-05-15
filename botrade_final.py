@@ -973,7 +973,61 @@ def es_hora_analisis(analizados_hoy):
             return True, clave
     return False, None
 
-def main():
+def monitorearStopLossTakeProfit(api):
+    """Revisa posiciones abiertas y cierra si alcanzan stop loss o take profit"""
+    try:
+        posiciones = api.list_positions()
+        if not posiciones:
+            return
+
+        for p in posiciones:
+            ticker        = p.symbol
+            pnl_pct       = float(p.unrealized_plpc) * 100
+            precio_actual = float(p.current_price)
+            precio_entrada= float(p.avg_entry_price)
+            acciones      = int(float(p.qty))
+            pnl           = float(p.unrealized_pl)
+
+            cerrar = False
+            razon  = ""
+
+            if pnl_pct <= -STOP_LOSS_PCT * 100:
+                cerrar = True
+                razon  = f"🛑 STOP LOSS ({pnl_pct:.1f}%)"
+            elif pnl_pct >= TAKE_PROFIT_PCT * 100:
+                cerrar = True
+                razon  = f"🎯 TAKE PROFIT ({pnl_pct:.1f}%)"
+
+            if cerrar:
+                try:
+                    api.submit_order(
+                        symbol=ticker,
+                        qty=acciones,
+                        side='sell',
+                        type='market',
+                        time_in_force='day'
+                    )
+                    emoji = "🟢" if pnl > 0 else "🔴"
+                    enviar_telegram(
+                        f"{emoji} <b>{razon}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📉 Activo: <b>{ticker}</b>\n"
+                        f"💵 Entrada: ${precio_entrada:,.2f}\n"
+                        f"💵 Salida: ${precio_actual:,.2f}\n"
+                        f"📦 Acciones: {acciones}\n"
+                        f"💰 P&L: ${pnl:,.2f} ({pnl_pct:.1f}%)\n"
+                        f"⏰ {datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y %H:%M')}"
+                    )
+                    sheets_registrar_operacion(
+                        razon.split()[1], ticker, precio_actual,
+                        acciones, acciones * precio_entrada, pnl, 100, 0
+                    )
+                    print(f"  {razon}: {ticker} | P&L: ${pnl:.2f}")
+                except Exception as e:
+                    print(f"Error cerrando {ticker}: {e}")
+
+    except Exception as e:
+        print(f"Error monitor SL/TP: {e}")
     print(f"\n{'='*60}")
     print(f"BOTRADE v4.0 — Sistema autonomo completo")
     print(f"{'='*60}")
@@ -1009,11 +1063,18 @@ def main():
 
     offset = 0
     analizados_hoy = set()
+    ultimo_monitor = 0
 
     while True:
         try:
             # Verificar comandos Telegram
             offset = procesarComandos(api, offset)
+
+            # Monitor Stop Loss / Take Profit cada 5 minutos
+            ahora_ts = time.time()
+            if ahora_ts - ultimo_monitor >= 300:
+                monitorearStopLossTakeProfit(api)
+                ultimo_monitor = ahora_ts
 
             # Verificar horario automático
             es_hora, clave = es_hora_analisis(analizados_hoy)
