@@ -30,12 +30,9 @@ NEWS_API_KEY = "ad535d6362b447528ab04ca93a7aa223"
 SHEETS_ID         = "1vDYcAozml3v98ncEE-Ywglg7xRMH8D8gICpbiLMyC3k"
 SHEETS_CREDS_FILE = "botrade-credentials.json"
 
-# BEAST MODE — 12 activos diversificados
-ACTIVOS = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN",
-    "SPY", "QQQ", "TSLA",
-    "BTC-USD", "ETH-USD", "SOL-USD",
-]
+ACTIVOS_ACCIONES = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "SPY", "QQQ", "TSLA"]
+ACTIVOS_CRYPTO   = ["BTC-USD", "ETH-USD", "SOL-USD"]
+ACTIVOS          = ACTIVOS_ACCIONES + ACTIVOS_CRYPTO
 
 CAPITAL_TOTAL       = 100000
 KELLY_FRACCION      = 0.25
@@ -53,6 +50,36 @@ ESTADO_FILE         = "botrade_estado.json"
 
 HORARIOS_ANALISIS = ["09:30", "13:00", "15:30"]
 ZONA_HORARIA      = pytz.timezone("America/Santiago")
+ZONA_NY           = pytz.timezone("America/New_York")
+
+# ============================================================
+# BUG FIX 1: HORARIO DE MERCADO
+# Acciones solo se compran/venden en horario de Wall Street
+# Criptos operan 24/7
+# ============================================================
+
+def mercadoAbierto():
+    """Verifica si Wall Street esta abierto ahora"""
+    try:
+        hora_ny = datetime.now(ZONA_NY)
+        dia_semana = hora_ny.weekday()  # 0=Lunes, 6=Domingo
+        if dia_semana >= 5:  # Sabado o Domingo
+            return False
+        hora = hora_ny.hour * 60 + hora_ny.minute
+        apertura = 9 * 60 + 30   # 9:30 AM NY
+        cierre   = 16 * 60        # 4:00 PM NY
+        return apertura <= hora < cierre
+    except:
+        return True  # Si falla, asume abierto para no bloquear criptos
+
+def esAccion(ticker):
+    return ticker in ACTIVOS_ACCIONES
+
+def puedeOperar(ticker):
+    """Retorna True si el activo puede operar ahora"""
+    if esAccion(ticker):
+        return mercadoAbierto()
+    return True  # Criptos siempre pueden operar
 
 # ============================================================
 # GOOGLE SHEETS
@@ -163,11 +190,16 @@ def sheets_registrar_senal(ticker, senal, precio, rsi, stoch_rsi, macd, atr, bb,
 # ============================================================
 
 def enviar_telegram(mensaje):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"})
-    except Exception as e:
-        print(f"Error Telegram: {e}")
+    # BUG FIX 2: Reintentos si falla Telegram
+    for intento in range(3):
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}, timeout=10)
+            if resp.status_code == 200:
+                return
+        except Exception as e:
+            print(f"Error Telegram intento {intento+1}: {e}")
+            time.sleep(2)
 
 def obtener_mensajes(offset=0):
     try:
@@ -184,14 +216,39 @@ def cargar_estado():
                 return json.load(f)
     except:
         pass
-    return {"activo": True, "ultimo_reporte_semanal": "", "pnl_inicio_dia": 0, "trailing_stops": {}}
+    return {"activo": True, "ultimo_reporte_semanal": "", "pnl_inicio_dia": 0, "trailing_stops": {}, "ultimo_reset_dia": ""}
 
 def guardar_estado(estado):
+    # BUG FIX 3: Escritura atomica para evitar corrupcion del archivo
     try:
-        with open(ESTADO_FILE, 'w') as f:
+        tmp = ESTADO_FILE + ".tmp"
+        with open(tmp, 'w') as f:
             json.dump(estado, f)
-    except:
-        pass
+        os.replace(tmp, ESTADO_FILE)
+    except Exception as e:
+        print(f"Error guardando estado: {e}")
+
+# ============================================================
+# BUG FIX 4: RESET DIARIO AUTOMATICO
+# Resetea el capital inicial del dia y reactiva el bot cada manana
+# ============================================================
+
+def verificarResetDiario(api):
+    estado = cargar_estado()
+    hoy = datetime.now(ZONA_HORARIA).strftime("%Y-%m-%d")
+    if estado.get("ultimo_reset_dia", "") != hoy:
+        try:
+            capital_actual = float(api.get_account().portfolio_value)
+            estado["pnl_inicio_dia"]   = capital_actual
+            estado["ultimo_reset_dia"] = hoy
+            # Reactivar bot si fue pausado por perdida diaria
+            if not estado.get("activo", True):
+                estado["activo"] = True
+                enviar_telegram(f"🌅 <b>Nuevo dia — Bot reactivado</b>\n💰 Capital: ${capital_actual:,.2f}\n⏰ {datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y %H:%M')}")
+            guardar_estado(estado)
+            print(f"✓ Reset diario completado — Capital inicio: ${capital_actual:,.2f}")
+        except Exception as e:
+            print(f"Error reset diario: {e}")
 
 # ============================================================
 # INDICADORES AVANZADOS
@@ -236,43 +293,61 @@ def calcularATR(highs, lows, closes, periodo=14):
         return 0
 
 def calcularEMA(closes, periodo):
+    if len(closes) < periodo:
+        return closes[-1]
     k = 2/(periodo+1)
     ema = closes[0]
     for c in closes[1:]: ema = c*k + ema*(1-k)
     return round(ema, 2)
 
 def calcularMACD(closes):
+    if len(closes) < 26:
+        return 0
     return round(calcularEMA(closes,12) - calcularEMA(closes,26) - calcularEMA(closes,9), 4)
 
 def calcularBollinger(closes, periodo=20):
+    if len(closes) < periodo:
+        return 50
     sl = closes[-periodo:]
     media = sum(sl)/periodo
     std = (sum((v-media)**2 for v in sl)/periodo)**0.5
+    if std == 0:
+        return 50
     precio = closes[-1]
     rango = 4*std
     return round((precio-(media-2*std))/rango*100, 1) if rango > 0 else 50
 
 def calcularVWAP(highs, lows, closes, volumes):
     try:
+        if not volumes or sum(volumes) == 0:
+            return closes[-1]
         typical = [(h+l+c)/3 for h,l,c in zip(highs, lows, closes)]
         total_vol = sum(volumes)
-        vwap = sum(t*v for t,v in zip(typical, volumes)) / total_vol if total_vol > 0 else closes[-1]
+        vwap = sum(t*v for t,v in zip(typical, volumes)) / total_vol
         return round(vwap, 2)
     except:
         return closes[-1]
 
 def obtenerVIX():
-    try:
-        datos = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
-        if isinstance(datos.columns, pd.MultiIndex):
-            datos.columns = datos.columns.get_level_values(0)
-        return round(float(datos["Close"].squeeze().dropna().iloc[-1]), 2)
-    except:
-        return 20
+    # BUG FIX 5: Reintentos para VIX
+    for intento in range(3):
+        try:
+            datos = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
+            if isinstance(datos.columns, pd.MultiIndex):
+                datos.columns = datos.columns.get_level_values(0)
+            vix = float(datos["Close"].squeeze().dropna().iloc[-1])
+            return round(vix, 2)
+        except:
+            time.sleep(2)
+    return 20  # Valor por defecto si falla
 
 def analizarSentimiento(ticker):
     try:
-        url = f"https://newsapi.org/v2/everything?q={ticker}+stock&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
+        # BUG FIX 6: Criptos usan nombre diferente en noticias
+        query = ticker.replace("-USD", "").replace("-", " ")
+        url = f"https://newsapi.org/v2/everything?q={query}+crypto&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
+        if esAccion(ticker):
+            url = f"https://newsapi.org/v2/everything?q={ticker}+stock&language=en&sortBy=publishedAt&pageSize=5&apiKey={NEWS_API_KEY}"
         resp = requests.get(url, timeout=5).json()
         positivas = ['surge','soars','gains','rises','record','beats','strong','growth','profit','bullish','rally','upgrade','higher','boost','earnings']
         negativas = ['falls','drops','plunges','loses','weak','miss','bearish','lower','concern','loss','decline','crash','warning','downgrade','lawsuit']
@@ -357,11 +432,11 @@ def calcularKelly(ticker):
         if not ganadas or not perdidas:
             return MIN_RIESGO
 
-        win_rate    = len(ganadas) / len(operaciones)
-        avg_gan     = np.mean(ganadas)
-        avg_per     = abs(np.mean(perdidas))
-        ratio_gp    = avg_gan / avg_per if avg_per > 0 else 1
-        kelly       = (win_rate * ratio_gp - (1 - win_rate)) / ratio_gp
+        win_rate = len(ganadas) / len(operaciones)
+        avg_gan  = np.mean(ganadas)
+        avg_per  = abs(np.mean(perdidas))
+        ratio_gp = avg_gan / avg_per if avg_per > 0 else 1
+        kelly    = (win_rate * ratio_gp - (1 - win_rate)) / ratio_gp
         return round(max(MIN_RIESGO, min(MAX_RIESGO, kelly * KELLY_FRACCION)), 4)
     except:
         return MIN_RIESGO
@@ -516,6 +591,8 @@ def verificarPerdidaDiaria(api):
         cuenta = api.get_account()
         capital_actual = float(cuenta.portfolio_value)
         pnl_inicio = estado.get("pnl_inicio_dia", capital_actual)
+        if pnl_inicio == 0:
+            return False
         perdida_dia = (capital_actual - pnl_inicio) / pnl_inicio
         if perdida_dia <= -MAX_PERDIDA_DIARIA:
             enviar_telegram(
@@ -537,6 +614,8 @@ def verificarTendenciaMercado():
         if isinstance(datos.columns, pd.MultiIndex):
             datos.columns = datos.columns.get_level_values(0)
         closes = datos["Close"].squeeze().dropna().tolist()
+        if len(closes) < 2:
+            return True
         cambio = (closes[-1] - closes[-2]) / closes[-2]
         if cambio <= -CAIDA_MERCADO_PCT:
             print(f"  ⚠️  Mercado cayendo {round(cambio*100,2)}%")
@@ -551,7 +630,12 @@ def verificarVolumen(ticker):
         if isinstance(datos.columns, pd.MultiIndex):
             datos.columns = datos.columns.get_level_values(0)
         vols = datos["Volume"].squeeze().dropna().tolist()
-        ratio = vols[-1] / (sum(vols[:-1])/len(vols[:-1]))
+        if len(vols) < 2:
+            return 1.0, True
+        promedio = sum(vols[:-1]) / len(vols[:-1])
+        if promedio == 0:
+            return 1.0, True
+        ratio = vols[-1] / promedio
         return round(ratio, 2), ratio >= VOLUMEN_MINIMO_X
     except:
         return 1.0, True
@@ -563,7 +647,7 @@ def verificarOrdenPendiente(api, ticker):
         return False
 
 # ============================================================
-# ANALIZAR ACTIVO (indicadores avanzados)
+# ANALIZAR ACTIVO
 # ============================================================
 
 def analizarActivo(ticker):
@@ -577,8 +661,14 @@ def analizarActivo(ticker):
         lows    = [float(x) for x in datos["Low"].squeeze().dropna().tolist()]
         volumes = [float(x) for x in datos["Volume"].squeeze().dropna().tolist()]
 
-        if len(closes) < 60:
+        # BUG FIX 7: Verificar que todos los arrays tengan el mismo largo
+        min_len = min(len(closes), len(highs), len(lows), len(volumes))
+        if min_len < 60:
             return None
+        closes  = closes[-min_len:]
+        highs   = highs[-min_len:]
+        lows    = lows[-min_len:]
+        volumes = volumes[-min_len:]
 
         precio    = closes[-1]
         cambio    = round((precio - closes[-2]) / closes[-2] * 100, 2)
@@ -593,25 +683,25 @@ def analizarActivo(ticker):
         vc = vv = 0
         razones = []
 
-        if rsi < 35:        vc += 2; razones.append(f"RSI sobrevendido ({rsi})")
-        elif rsi > 65:      vv += 2; razones.append(f"RSI sobrecomprado ({rsi})")
-        if stoch_rsi < 20:  vc += 1; razones.append(f"StochRSI bajo ({stoch_rsi})")
+        if rsi < 35:         vc += 2; razones.append(f"RSI sobrevendido ({rsi})")
+        elif rsi > 65:       vv += 2; razones.append(f"RSI sobrecomprado ({rsi})")
+        if stoch_rsi < 20:   vc += 1; razones.append(f"StochRSI bajo ({stoch_rsi})")
         elif stoch_rsi > 80: vv += 1; razones.append(f"StochRSI alto ({stoch_rsi})")
-        if emaDiff > 0.3:   vc += 2; razones.append(f"EMA alcista (+{emaDiff}%)")
+        if emaDiff > 0.3:    vc += 2; razones.append(f"EMA alcista (+{emaDiff}%)")
         elif emaDiff < -0.3: vv += 2; razones.append(f"EMA bajista ({emaDiff}%)")
-        if macd > 0:        vc += 1; razones.append(f"MACD positivo ({macd})")
-        else:               vv += 1; razones.append(f"MACD negativo ({macd})")
-        if bb < 20:         vc += 1; razones.append(f"Bollinger banda baja ({bb}%)")
-        elif bb > 80:       vv += 1; razones.append(f"Bollinger banda alta ({bb}%)")
-        if precio > vwap:   vc += 1; razones.append(f"Sobre VWAP (${vwap})")
-        elif precio < vwap: vv += 1; razones.append(f"Bajo VWAP (${vwap})")
+        if macd > 0:         vc += 1; razones.append(f"MACD positivo ({macd})")
+        else:                vv += 1; razones.append(f"MACD negativo ({macd})")
+        if bb < 20:          vc += 1; razones.append(f"Bollinger banda baja ({bb}%)")
+        elif bb > 80:        vv += 1; razones.append(f"Bollinger banda alta ({bb}%)")
+        if precio > vwap:    vc += 1; razones.append(f"Sobre VWAP (${vwap})")
+        elif precio < vwap:  vv += 1; razones.append(f"Bajo VWAP (${vwap})")
 
         sentimiento = analizarSentimiento(ticker)
         razones.append(f"Noticias: {sentimiento}")
-        if sentimiento == 'MUY POSITIVO':  vc += 1
-        elif sentimiento == 'POSITIVO':    vc += 0.5
+        if sentimiento == 'MUY POSITIVO':   vc += 1
+        elif sentimiento == 'POSITIVO':     vc += 0.5
         elif sentimiento == 'MUY NEGATIVO': vv += 1
-        elif sentimiento == 'NEGATIVO':    vv += 0.5
+        elif sentimiento == 'NEGATIVO':     vv += 0.5
 
         confianza = round(max(vc, vv) / 9 * 100)
         senal = "COMPRAR" if vc >= 5 else "VENDER" if vv >= 5 else "MANTENER"
@@ -647,13 +737,16 @@ def ejecutarOrden(api, resultado, vix, mercado_ok, kelly_pct):
         n_posiciones = len(posiciones)
 
         if senal == "COMPRAR" and ticker not in pos_dict:
+            # BUG FIX 1: Verificar horario de mercado antes de comprar
+            if not puedeOperar(ticker):
+                return f"⏰ Mercado cerrado para {ticker}"
             if verificarOrdenPendiente(api, ticker):
                 return f"⚠️ Orden pendiente para {ticker}"
-            if not mercado_ok:
+            if not mercado_ok and esAccion(ticker):
                 return "⚠️ Mercado cayendo — bloqueado"
             if n_posiciones >= MAX_POSICIONES:
                 return f"⚠️ Max posiciones ({MAX_POSICIONES})"
-            if vix > 30:
+            if vix > 30 and esAccion(ticker):
                 return f"⚠️ VIX alto ({vix})"
 
             ok_corr, correlado_con = verificarCorrelacion(ticker, posiciones)
@@ -661,13 +754,20 @@ def ejecutarOrden(api, resultado, vix, mercado_ok, kelly_pct):
                 return f"⚠️ Correlacionado con {correlado_con}"
 
             vol_ratio, vol_ok = verificarVolumen(ticker)
-            if not vol_ok:
+            if not vol_ok and esAccion(ticker):
                 return f"⚠️ Volumen bajo ({vol_ratio}x)"
 
             stop_precio = round(precio * (1 - STOP_LOSS_PCT), 2)
-            acciones    = int((CAPITAL_TOTAL * kelly_pct) / (precio - stop_precio))
+            diff = precio - stop_precio
+            if diff <= 0:
+                return "⚠️ Stop precio invalido"
+            acciones = int((CAPITAL_TOTAL * kelly_pct) / diff)
 
-            if acciones > 0 and capital >= acciones * precio:
+            # BUG FIX 8: Verificar que acciones sea al menos 1
+            if acciones < 1:
+                return "⚠️ Kelly insuficiente para comprar 1 accion"
+
+            if capital >= acciones * precio:
                 api.submit_order(symbol=ticker, qty=acciones, side='buy', type='market', time_in_force='day')
                 inversion = acciones * precio
 
@@ -696,9 +796,14 @@ def ejecutarOrden(api, resultado, vix, mercado_ok, kelly_pct):
             return "Capital insuficiente"
 
         elif senal == "VENDER" and ticker in pos_dict:
+            # BUG FIX 1: Verificar horario para ventas de acciones
+            if not puedeOperar(ticker):
+                return f"⏰ Mercado cerrado para {ticker}"
             acciones       = int(float(pos_dict[ticker].qty))
             pnl            = float(pos_dict[ticker].unrealized_pl)
             precio_entrada = float(pos_dict[ticker].avg_entry_price)
+            if acciones < 1:
+                return "⚠️ Sin acciones para vender"
             api.submit_order(symbol=ticker, qty=acciones, side='sell', type='market', time_in_force='day')
             emoji = "🟢" if pnl > 0 else "🔴"
             enviar_telegram(
@@ -779,6 +884,10 @@ def monitorearStopLossTakeProfit(api):
             acciones      = int(float(p.qty))
             pnl           = float(p.unrealized_pl)
 
+            if acciones < 1:
+                continue
+
+            # Actualizar trailing stop
             ts_actual = trailing_stops.get(ticker, precio_entrada * (1 - TRAILING_STOP_PCT))
             nuevo_ts  = precio_actual * (1 - TRAILING_STOP_PCT)
             if nuevo_ts > ts_actual:
@@ -799,6 +908,10 @@ def monitorearStopLossTakeProfit(api):
                 razon  = f"📉 TRAILING STOP (${ts_actual:.2f})"
 
             if cerrar:
+                # BUG FIX 1: No cerrar acciones fuera de horario
+                if not puedeOperar(ticker):
+                    print(f"  ⏰ {razon} detectado para {ticker} pero mercado cerrado")
+                    continue
                 try:
                     api.submit_order(symbol=ticker, qty=acciones, side='sell', type='market', time_in_force='day')
                     emoji = "🟢" if pnl > 0 else "🔴"
@@ -836,10 +949,12 @@ def cmd_estado(api):
         estado     = cargar_estado()
         status     = "✅ ACTIVO" if estado.get("activo", True) else "⏸ PAUSADO"
         emoji      = "🟢" if pnl_total >= 0 else "🔴"
+        mercado    = "🟢 ABIERTO" if mercadoAbierto() else "🔴 CERRADO"
         enviar_telegram(
             f"🤖 <b>ESTADO</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{status}\n"
+            f"🏛️ Mercado: {mercado}\n"
             f"💰 Portafolio: ${float(cuenta.portfolio_value):,.2f}\n"
             f"💵 Cash: ${float(cuenta.cash):,.2f}\n"
             f"{emoji} P&L: ${pnl_total:,.2f}\n"
@@ -988,8 +1103,9 @@ def ejecutarAnalisis(api):
     mercado_ok  = verificarTendenciaMercado()
     estado_merc = "FAVORABLE" if mercado_ok else "CAYENDO"
     capital     = float(api.get_account().portfolio_value)
+    abierto     = mercadoAbierto()
 
-    print(f"VIX: {vix} ({estado_vix}) | Mercado: {estado_merc}")
+    print(f"VIX: {vix} ({estado_vix}) | Mercado: {estado_merc} | Wall St: {'ABIERTO' if abierto else 'CERRADO'}")
     print("Calculando Kelly...")
 
     kelly_activos = {}
@@ -1004,6 +1120,7 @@ def ejecutarAnalisis(api):
         f"📊 Activos: {len(ACTIVOS)}\n"
         f"😨 VIX: {vix} ({estado_vix})\n"
         f"📈 Mercado: {estado_merc}\n"
+        f"🏛️ Wall St: {'🟢 Abierto' if abierto else '🔴 Cerrado'}\n"
         f"💰 Portafolio: ${capital:,.2f}\n"
         f"⏰ {ahora}"
     )
@@ -1110,13 +1227,19 @@ def main():
 
     while True:
         try:
+            # Reset diario automatico
+            verificarResetDiario(api)
+
+            # Comandos Telegram
             offset = procesarComandos(api, offset)
 
+            # Monitor SL/TP/Trailing cada 5 minutos
             ahora_ts = time.time()
             if ahora_ts - ultimo_monitor >= 300:
                 monitorearStopLossTakeProfit(api)
                 ultimo_monitor = ahora_ts
 
+            # Analisis programado
             es_hora, clave = es_hora_analisis(analizados_hoy)
             if es_hora:
                 print(f"\n⏰ Análisis programado: {hora_chile()}")
@@ -1130,7 +1253,7 @@ def main():
             enviar_telegram("🛑 BOTRADE detenido.")
             break
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error loop principal: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
